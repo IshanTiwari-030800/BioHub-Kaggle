@@ -7,8 +7,11 @@ not reproducible from that notebook). This is a from-scratch implementation
 meant to sit directly on top of the `TemporalUNet3D` detector already trained
 in this repo (`repo/models/temporal_unet.py`, weights in `weights/`).
 
-Not trained yet — this is the architecture + loss/metric utilities + a
-graph-assembly helper. See "Training this" below for what's still needed.
+**Training-ready.** `repo/train_edge.py` trains it end-to-end on top of the
+pretrained `TemporalUNet3D` backbone (`weights/centroid_unet_best.pt`),
+mirroring `train.py`'s exact paradigm (self-spawning DDP, wandb logging,
+`EdgeTrainConfig` dataclass, best/last checkpointing). See "Training this"
+below for how to run it, including on Kaggle.
 
 ## Where it sits in the pipeline
 
@@ -127,12 +130,23 @@ out["valid_masks"]  # {(t_a, t_b): (B, N, N)} bool, matches edge_logits' finite 
   matches are a tiny fraction of geometrically-plausible candidate pairs,
   same imbalance `detection_loss` corrects for between GT voxels and
   background.
+- `edge_focal_loss(logits, pos_mask, valid_mask, gamma=2.0)` — what
+  `train_edge.py` actually trains with. Column-softmax (over the *source*
+  axis) + focal BCE, matching pilkwang's vendored `train_unet_transformer.py`
+  loss (`compute_loss`). Normalizing over sources per target column encodes
+  "at most one true parent per target" (no merges) while leaving the source
+  axis free to score high against multiple targets (divisions are fine).
+  This is a materially different inductive bias than `edge_bce_loss`'s
+  independent per-pair sigmoids — see "Why the loss changed" below.
 - `edge_precision_recall(logits, pos_mask, valid_mask, threshold=0.0)` — raw
   TP/FP/FN counts at a given logit threshold (0.0 = prob 0.5), for computing
-  precision/recall/F1 during validation.
+  precision/recall/F1 during validation. Works the same regardless of which
+  loss trained the model.
 
-Both take `pos_mask: (B, N, M)` bool — ground-truth same-cell pairs — which
-the caller has to build from the `.geff` graph's edges (see below).
+All three take `pos_mask: (B, N, M)` bool — ground-truth same-cell pairs —
+which `train_edge.py` builds directly from each window's `.geff` edges (see
+below); `edge_bce_loss` is kept as a simpler independent-sigmoid alternative
+but isn't what `train_edge.py` uses by default.
 
 ## Building the motion graph
 
@@ -158,55 +172,168 @@ shape as input. Overlapping windows (`window_stride < WINDOW_SIZE`) will
 propose the same edge more than once when stitched together — dedupe by
 `(source, target)` keeping the max `edge_prob`.
 
-## Training this (not yet implemented — sketch for next step)
+## Training this — `repo/train_edge.py`
 
-No `train_edge.py` yet. The pieces above are enough to write one closely
-mirroring `train.py`'s structure:
+Mirrors `train.py`'s exact paradigm: self-spawning DDP (no `torchrun`
+needed), wandb logging from rank 0, a no-CLI `EdgeTrainConfig` dataclass you
+build and pass to `run()`, best/last checkpointing. All new dataset/model
+code lives in `train_edge.py`; it imports and reuses `train.py`'s
+`CentroidUNet`, `detection_loss`, `centroid_recall`, `DEFAULT_AUGMENTATIONS`,
+and the DDP helpers directly rather than duplicating them.
 
-1. **Reuse `CentroidWindowDataset`/`load_video_windows`** for windowed
-   images + GT centroids — already gives `(imgs, coords, mask)` per window.
-2. **Positive pairs**, per window, come straight from the `.geff` graph's
-   real edges (not from any ID-encoding convention — read them directly):
+**Data pipeline (`load_edge_video_windows`, `EdgeWindowDataset`).** Same
+windowing as `train.py`'s `load_video_windows`, but also indexes each
+video's `.geff` edges by source frame and, for every window and every
+scoreable frame-pair offset `(i, j)` (all of `itertools.combinations(range(3), 2)`
+= `{(0,1), (1,2), (0,2)}` for `WINDOW_SIZE=3` — exactly the pairs
+`NodeTransformer` scores with `skip_frame_edges=True`), builds a
+`(K, 2)` array of local `(source_idx, target_idx)` pairs from real graph
+edges with `t[u] == t_start+i` and `t[v] == t_start+j`. Since `.geff` only
+stores real edges (not a transitive closure), this naturally captures both
+consecutive-frame lineage and genuine gap edges (annotator skipped a frame
+for that cell) with the same lookup. `train.py`'s existing augmentations
+(flip, rot90, brightness, contrast/gamma, noise) are reused unchanged — they
+only ever transform coordinate *values* or flip the image, never reorder the
+node axis, so index-based positive pairs stay valid after augmentation.
 
+**Trains on GT centroids, not detector peaks** (teacher forcing) — a
+deliberate simplification vs. pilkwang's vendored recipe, which trains on
+the detector's own live peaks (run detection → NMS peak-extract → greedy
+match to GT → propagate GT edges through the match) every step. Teacher
+forcing is simpler and has no risk of degenerate batches (e.g. zero peaks
+early in training); the cost is a train/inference distribution mismatch,
+since inference still runs on peak-extracted detections. Worth revisiting
+with pilkwang's live-detect-and-match loop as a follow-up once this baseline
+is validated (see "Known limitations").
+
+**Backbone fine-tunes jointly by default** (`freeze_backbone=False`),
+matching pilkwang's end-to-end recipe rather than a frozen-features
+approach: `EdgeModel` wraps the pretrained `CentroidUNet` + `NodeTransformer`
+and backprops the edge loss straight into the backbone, plus an auxiliary
+`detection_loss` (weight `det_loss_weight=0.1`) so the backbone doesn't
+drift away from what made it good at detection while it adapts for
+matching. Set `freeze_backbone=True` for a faster, lower-risk run that only
+trains `NodeTransformer` (no detection loss computed in that mode — nothing
+to train the head with).
+
+**Why the loss changed**: `train_edge.py` trains with `edge_focal_loss`
+(column-softmax + focal, pilkwang's formulation — see above), not
+`edge_bce_loss`. One consequence worth knowing before reading validation
+curves: for a target with exactly one valid candidate parent (no real
+competition — common in this dataset's sparser videos, e.g.
+`44b6_0113de3b.geff` has ~1 node/frame throughout), softmax over a
+single-element axis is trivially 1.0 regardless of the logit, so that pair
+contributes exactly zero loss/gradient. This is correct, not a bug — there's
+no decision to learn when there's only one option — but it means the
+reported edge loss on sparse windows can be exactly 0.0 even from an
+untrained model. Busier videos (some have up to 11 cells/frame) are where
+the loss actually has signal.
+
+**Smoke-tested with real data** (not just random tensors): pretrained
+`weights/centroid_unet_best.pt` loads into `CentroidUNet` with `strict=True`
+(architectures match exactly), a full forward+backward step was verified to
+update both `NodeTransformer` and backbone parameters (diffed before/after),
+and `evaluate()` produces finite, non-degenerate precision/recall on both a
+sparse and a busy real video from `data/train/`.
+
+### Running it
+
+```python
+from train_edge import EdgeTrainConfig, run
+
+run(EdgeTrainConfig(
+    data_dir="data/train",                              # dir of matching <id>.zarr / <id>.geff
+    unet_weights="weights/centroid_unet_best.pt",        # required: stage-1 detector checkpoint
+    output_dir="weights",                                # writes edge_model_{best,last}.pt here
+    n_epochs=50,
+    lr=1e-4,
+    batch_size=4,                                        # per-GPU
+    freeze_backbone=False,                                # True = faster/safer, skips detection loss
+    wandb_project="biohub-cell-tracking",
+    wandb_run_name="edge-v1",
+))
+```
+
+`unet_out_channels` / `unet_layers` / `unet_n_heads` / `unet_n_points` in
+`EdgeTrainConfig` must match whatever `TrainConfig` was used to produce
+`unet_weights` (defaults on both sides already agree: `32`, `[32,64,128]`,
+`4`, `4`) — `centroid_unet.load_state_dict(state, strict=True)` will raise
+immediately if they don't.
+
+**Logged to wandb** (project `biohub-cell-tracking` by default, same as
+`train.py`): per-step `train/loss_step`, `train/edge_loss_step`,
+`train/det_loss_step`, `train/grad_norm`, `train/lr`; per-epoch
+`train/loss_epoch`, `train/edge_loss_epoch`, `train/det_loss_epoch`,
+`val/loss`, `val/edge_loss`, `val/det_loss`, `val/edge_precision`,
+`val/edge_recall`, `val/edge_f1`, `val/best_edge_f1`, `val/det_recall` (only
+when `freeze_backbone=False`), plus `data/n_train_windows`,
+`data/n_val_windows`, `model/n_trainable_params`. Checkpoint selection is by
+best `val/edge_f1`, same pattern as `train.py` selecting on `val/recall`.
+
+### Running on Kaggle
+
+Same shape as how `train.py` expects to be run (see its docstring), extended
+with the extra pretrained-backbone dependency:
+
+1. **Attach two datasets** to the notebook: the competition data (for
+   `<id>.zarr`/`<id>.geff`) and a dataset containing this repo's
+   `weights/centroid_unet_best.pt` (upload it as a private Kaggle dataset
+   once, or re-run `train.py`'s stage first in the same session).
+2. **Set the wandb API key** as a Kaggle secret (Add-ons → Secrets →
+   `WANDB_API_KEY`), then in the notebook:
    ```python
-   graph, _ = geff.read(str(geff_path), node_props=["t"])
-   # index GT centroids in coords[t_a] / coords[t_b] the same order load_video_windows built them in,
-   # then for each geff edge (u, v) with t[u] == t_start + t_a and t[v] == t_start + t_b:
-   #     pos_mask[b, index_of(u), index_of(v)] = True
+   from kaggle_secrets import UserSecretsClient
+   import os
+   os.environ["WANDB_API_KEY"] = UserSecretsClient().get_secret("WANDB_API_KEY")
    ```
+   (skip this and pass `wandb_mode="offline"` or `"disabled"` if you don't
+   want to log during the run).
+3. **Install deps** (same as this repo's inference environment) and put the
+   repo on `sys.path`:
+   ```python
+   !pip install -q geff zarr wandb
+   import sys; sys.path.append("/kaggle/working/BioHub-Kaggle/repo")
+   ```
+4. **Run**:
+   ```python
+   from train_edge import EdgeTrainConfig, run
 
-   `load_video_windows` builds `window.coords[i]` straight from
-   `graph.nodes(data=True)` per frame — keep that same per-frame node order
-   (and the underlying geff node ids) around when building windows so edges
-   can be looked up by index instead of re-deriving them from node ids.
-3. **Train on GT centroids, not detector peaks** (teacher forcing), same
-   reasoning `train.py` uses GT voxels for `detection_loss` rather than the
-   model's own noisy peaks — matches during training should reflect true
-   cell identity, not detector noise. Optionally fine-tune end-to-end with
-   detector peaks later once both stages work independently.
-4. **Freeze vs. fine-tune the backbone**: cheapest path is loading
-   `weights/centroid_unet_best.pt`, freezing `CentroidUNet.unet`, and only
-   training `NodeTransformer` on top (fast, no risk of degrading detection
-   recall). Unfreezing later is a valid follow-up if edge accuracy plateaus
-   on backbone features that weren't trained to be matching-discriminative.
-5. **Loss**: `sum(edge_bce_loss(...) for each scored pair) / n_pairs`, same
-   pattern as `train.py`'s per-frame loss averaging.
-6. **Metric**: precision/recall/F1 from `edge_precision_recall`, aggregated
-   the same way `train.py` reduces `centroid_recall`'s counts across
-   ranks/batches before dividing.
+   run(EdgeTrainConfig(
+       data_dir="/kaggle/input/biohub-cell-tracking-during-development/train",
+       unet_weights="/kaggle/input/<your-backbone-weights-dataset>/centroid_unet_best.pt",
+       output_dir="/kaggle/working/weights",
+       n_epochs=50,
+       n_gpus=2,          # match the accelerator (e.g. "GPU T4 x2"); None = auto-detect all visible
+       wandb_mode="online",
+   ))
+   ```
+5. **After training**, `/kaggle/working/weights/edge_model_{best,last}.pt`
+   holds the full `EdgeModel` state dict (backbone + `NodeTransformer`
+   together) — load it back with the same `CentroidUNet`/`NodeTransformer`
+   construction shown in `train_edge.train()` before feeding real detector
+   output through `assemble_candidate_graph` for the ILP stage.
 
 ## Known limitations
 
-- Independent per-pair sigmoids, not a joint assignment — a node can score
-  high against multiple partners (expected/useful for divisions, but note
-  the module itself doesn't enforce "at most one parent"; that's left to
-  the downstream tracker, matching the reference pipeline's own
-  single-parent-repair being a *separate* pass, §4.6).
+- Trains on GT centroids (teacher forcing), not the detector's own peaks —
+  see "Trains on GT centroids, not detector peaks" above. The ILP stage that
+  consumes this module's output at inference time will still see real
+  peak-extraction noise the model never saw during training.
+- Independent per-pair sigmoids in `edge_bce_loss` (still available, not the
+  default) vs. `edge_focal_loss`'s column-softmax — the latter structurally
+  forbids merges (one parent per target) but doesn't forbid a node scoring
+  high against multiple partners across different target columns, which is
+  what a division needs. Neither loss enforces global consistency (e.g. two
+  different targets both claiming the same single-candidate parent isn't
+  prevented); that's still left to the downstream ILP/tracker, matching the
+  reference pipeline's own separation of concerns.
 - `t_b - t_a` is a raw frame-count in `geo_bias_mlp`, not physical time —
   fine while every window is uniformly-spaced `WINDOW_SIZE=3` frames, would
   need revisiting for irregular frame spacing.
-- Only smoke-tested (forward shapes, zero-init, gradient flow, loss/metric
-  sanity, graph assembly) with random tensors — no training run yet, so
-  hyperparameters (`embed_dim=128`, `n_layers=3`, `max_link_distance_um=14.0`)
-  are reasonable defaults/priors from the reference pipeline's tuned
-  constants, not empirically tuned for this implementation.
+- Verified end-to-end on real data with a tiny number of steps (forward
+  shapes, strict weight loading, gradient flow into both submodels, finite
+  loss/metrics) — not a full training run, so hyperparameters
+  (`embed_dim=128`, `n_layers=3`, `max_link_distance_um=14.0`,
+  `det_loss_weight=0.1`, `focal_gamma=2.0`) are reasonable priors from the
+  reference pipeline's tuned constants, not empirically tuned for this
+  implementation.

@@ -306,6 +306,47 @@ def edge_bce_loss(
     return F.binary_cross_entropy_with_logits(logits_safe, target, weight=weight, reduction="sum") / B
 
 
+def edge_focal_loss(
+    logits: torch.Tensor,      # (B, N, M), N=source frame candidates, M=target frame candidates
+    pos_mask: torch.Tensor,    # (B, N, M) bool, GT same-cell pairs
+    valid_mask: torch.Tensor,  # (B, N, M) bool, candidate is scoreable (finite logit)
+    gamma: float = 2.0,
+) -> torch.Tensor:
+    """Column-softmax + focal BCE, matching pilkwang's ``compute_loss`` (the
+    vendored ``train_unet_transformer.py`` this project extends to T=3).
+
+    Softmax is taken over the *source* axis (dim=1) so every target
+    candidate's incoming probability mass sums to 1 across its competing
+    parents — encodes "at most one true parent per target" (no merges)
+    while leaving the source axis unconstrained, so one source can still
+    score high against two targets (a division). This is a materially
+    different inductive bias than ``edge_bce_loss``'s independent
+    per-pair sigmoids, which enforce neither constraint.
+
+    Only GT-annotated rows/columns are supervised (``active_mask``): most
+    of a distance-gated candidate matrix has no annotated node on one side
+    at all, and those cells carry no information about matching, same
+    "unannotated cells ignored" reasoning as the reference implementation.
+    """
+    logits = logits.masked_fill(~valid_mask, float("-inf"))
+    probs = torch.softmax(logits, dim=1)
+    probs = torch.nan_to_num(probs, nan=0.0)  # target columns with zero valid sources -> softmax over all -inf
+
+    target = (pos_mask & valid_mask).float()
+    active_rows = (pos_mask & valid_mask).any(dim=2)  # (B, N)
+    active_cols = (pos_mask & valid_mask).any(dim=1)  # (B, M)
+    active_mask = (active_rows.unsqueeze(2) | active_cols.unsqueeze(1)) & valid_mask
+
+    bce = F.binary_cross_entropy(probs.clamp(1e-6, 1.0 - 1e-6), target, reduction="none")
+    p_t = probs * target + (1 - probs) * (1 - target)
+    focal = (1 - p_t) ** gamma
+
+    B = logits.shape[0]
+    denom = active_mask.reshape(B, -1).sum(dim=1).clamp(min=1)
+    per_sample = (focal * bce * active_mask.float()).reshape(B, -1).sum(dim=1) / denom
+    return per_sample.mean()
+
+
 @torch.no_grad()
 def edge_precision_recall(
     logits: torch.Tensor,
