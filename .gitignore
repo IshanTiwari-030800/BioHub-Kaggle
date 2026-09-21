@@ -2,3 +2,5 @@
 /nbs
 /data_zip
 /weights
+__pycache__/
+*.pyc
