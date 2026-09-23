@@ -27,12 +27,14 @@ from __future__ import annotations
 import argparse
 import csv
 import os
+import shutil
 import sys
 import time
 from pathlib import Path
 
 import pandas as pd
 import torch
+import torch.multiprocessing as mp
 
 _repo_dir = Path(__file__).resolve().parent
 sys.path.insert(0, str(_repo_dir / "models"))
@@ -187,6 +189,114 @@ def run_submission(
     return submission, run_stats
 
 
+def _run_worker(
+    rank: int,
+    world_size: int,
+    zarr_paths: list[Path],
+    weights_path: Path,
+    predict_cfg: PredictConfig,
+    calib_cfg: CalibrationConfig,
+    max_frames: int | None,
+    tmp_dir: Path,
+) -> None:
+    """One GPU's share of the video list. Writes its own partial rows/stats CSVs
+    to tmp_dir rather than returning them, since mp.spawn workers can't hand
+    results back to the parent directly."""
+    device = torch.device(f"cuda:{rank}")
+    torch.cuda.set_device(device)
+    centroid_unet, node_transformer, downsample = load_model(weights_path, device)
+
+    # Round-robin sharding (not contiguous blocks) so a run of unusually slow
+    # videos doesn't pile onto a single GPU while the other idles.
+    shard = zarr_paths[rank::world_size]
+
+    all_rows: list[dict] = []
+    stats_rows: list[dict] = []
+    for zarr_path in shard:
+        dataset = zarr_path.stem
+        node_rows, edge_rows, stats = run_video(
+            dataset, zarr_path, centroid_unet, node_transformer, downsample, device,
+            predict_cfg, calib_cfg, max_frames=max_frames,
+        )
+        all_rows.extend(node_rows)
+        all_rows.extend(edge_rows)
+        stats_rows.append(stats)
+        print(f"  [GPU {rank}] {dataset}: stage1-3={stats['stage13_nodes']}n/{stats['stage13_edges']}e -> "
+              f"final={stats['final_nodes']}n/{stats['final_edges']}e ({stats['predict_sec']}s)", flush=True)
+
+    row_cols = [c for c in CSV_COLUMNS if c != "id"]
+    pd.DataFrame(all_rows, columns=row_cols).to_csv(tmp_dir / f"_rows_rank{rank}.csv", index=False)
+    pd.DataFrame(stats_rows).to_csv(tmp_dir / f"_stats_rank{rank}.csv", index=False)
+
+
+def run_submission_multi_gpu(
+    test_dir: Path,
+    weights_path: Path,
+    out_csv: Path,
+    out_stats_csv: Path,
+    limit: int | None = None,
+    max_frames: int | None = None,
+    predict_cfg: PredictConfig = SWEEP_PREDICT_CONFIG,
+    calib_cfg: CalibrationConfig | None = None,
+    n_gpus: int | None = None,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Same output as run_submission, but shards the video list across all
+    visible GPUs (self-spawned worker processes, no torchrun needed -- same
+    pattern as train.py/train_edge.py's DDP setup, minus the process-group
+    machinery since inference workers never need to talk to each other).
+
+    Falls back to the single-process run_submission for <2 GPUs -- spawning
+    is pure overhead there.
+    """
+    calib_cfg = calib_cfg or CalibrationConfig()
+    n_gpus = n_gpus if n_gpus is not None else torch.cuda.device_count()
+    if n_gpus < 2:
+        return run_submission(
+            test_dir, weights_path, out_csv, out_stats_csv,
+            limit=limit, max_frames=max_frames, predict_cfg=predict_cfg, calib_cfg=calib_cfg,
+        )
+
+    zarr_paths = sorted(test_dir.glob("*.zarr"))
+    if limit is not None:
+        zarr_paths = zarr_paths[:limit]
+    if not zarr_paths:
+        raise FileNotFoundError(f"No .zarr videos found under {test_dir}")
+
+    print(f"Sharding {len(zarr_paths)} videos across {n_gpus} GPUs (round-robin)", flush=True)
+
+    tmp_dir = out_csv.resolve().parent / "_submission_shards"
+    if tmp_dir.exists():
+        shutil.rmtree(tmp_dir)
+    tmp_dir.mkdir(parents=True)
+
+    mp.spawn(
+        _run_worker,
+        args=(n_gpus, zarr_paths, weights_path, predict_cfg, calib_cfg, max_frames, tmp_dir),
+        nprocs=n_gpus,
+        join=True,
+    )
+
+    row_frames = [pd.read_csv(tmp_dir / f"_rows_rank{r}.csv") for r in range(n_gpus)]
+    stats_frames = [pd.read_csv(tmp_dir / f"_stats_rank{r}.csv") for r in range(n_gpus)]
+
+    # node_id/source_id/target_id are only meaningful within their own
+    # "dataset" group (see check_schema) -- concatenation order across
+    # videos/GPUs doesn't affect correctness, only the outer `id` row index,
+    # which we regenerate fresh below.
+    submission = pd.concat(row_frames, ignore_index=True)
+    submission = submission.sort_values("dataset", kind="stable").reset_index(drop=True)
+    submission.index.name = "id"
+    submission = submission[[c for c in CSV_COLUMNS if c != "id"]]
+    submission.to_csv(out_csv)
+
+    run_stats = pd.concat(stats_frames, ignore_index=True).sort_values("dataset").reset_index(drop=True)
+    run_stats.to_csv(out_stats_csv, index=False)
+
+    shutil.rmtree(tmp_dir)
+    print(f"\nWrote {out_csv} ({len(submission)} rows) and {out_stats_csv}", flush=True)
+    return submission, run_stats
+
+
 def check_schema(submission: pd.DataFrame) -> bool:
     """Mirrors nbs/submissions/submission_exp.ipynb cell 22."""
     exp_cols = ["dataset", "row_type", "node_id", "t", "z", "y", "x", "source_id", "target_id"]
@@ -214,16 +324,21 @@ def main() -> None:
     parser.add_argument("--out-stats", type=str, default="run_stats.csv")
     parser.add_argument("--limit", type=int, default=None, help="Only process the first N videos (dry-run/debug).")
     parser.add_argument("--max-frames", type=int, default=None, help="Only process the first N frames per video (dry-run/debug).")
+    parser.add_argument("--n-gpus", type=int, default=None,
+                         help="Number of GPUs to shard videos across. Default: all visible GPUs "
+                              "(torch.cuda.device_count()). Set to 1 to force single-GPU/CPU mode.")
     args = parser.parse_args()
 
     test_dir = Path(args.test_dir) if args.test_dir else _default_test_dir()
     weights = Path(args.weights) if args.weights else _REPO_ROOT / "weights" / "edge_model_best.pt"
+    n_gpus = args.n_gpus if args.n_gpus is not None else torch.cuda.device_count()
 
-    print(f"test_dir={test_dir} | weights={weights} | limit={args.limit} | max_frames={args.max_frames}", flush=True)
-    submission, run_stats = run_submission(
+    print(f"test_dir={test_dir} | weights={weights} | limit={args.limit} | max_frames={args.max_frames} | "
+          f"n_gpus={n_gpus}", flush=True)
+    submission, run_stats = run_submission_multi_gpu(
         test_dir=test_dir, weights_path=weights,
         out_csv=Path(args.out), out_stats_csv=Path(args.out_stats),
-        limit=args.limit, max_frames=args.max_frames,
+        limit=args.limit, max_frames=args.max_frames, n_gpus=n_gpus,
     )
     check_schema(submission)
 
