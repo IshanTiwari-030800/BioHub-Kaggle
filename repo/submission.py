@@ -56,13 +56,19 @@ _COMP_DIR_CANDIDATES = [
 ]
 CSV_COLUMNS = ["id", "dataset", "row_type", "node_id", "t", "z", "y", "x", "source_id", "target_id"]
 
-# Threshold-sweep winning config (THRESHOLD_SWEEP.md), superseding predict.py's
-# pilkwang-derived defaults.
+# Threshold-sweep winning config (THRESHOLD_SWEEP_VAL.md, 20-video held-out
+# validation sweep), superseding both predict.py's pilkwang-derived defaults
+# and THRESHOLD_SWEEP.md's earlier single-video pick (which, found during the
+# validation sweep, was tuned on 6bba_372c8cb8 -- a TRAINING-split video, not
+# held-out). Caveat carried over from THRESHOLD_SWEEP_VAL.md: this det/pool
+# pair was never scored on the 8 densest validation videos (a sweep-script
+# node-count guard aborted before scoring them), so it is unvalidated at high
+# cell density -- see that doc before trusting this beyond the tested range.
 SWEEP_PREDICT_CONFIG = PredictConfig(
-    det_threshold=0.7,
-    pool_kernel_um=12.0,
+    det_threshold=0.8,
+    pool_kernel_um=10.0,
     edge_activation="softmax",
-    threshold=0.7,
+    threshold=0.5,
     use_ilp=True,
     ilp_edge_weight=-1.0,
     ilp_appearance_weight=0.1,
